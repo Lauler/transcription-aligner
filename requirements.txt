@@ -1,0 +1,9 @@
+torch
+torchaudio
+transformers
+datasets
+nltk
+ctc-segmentation
+pysrt
+num2words
+rixvox @ git+https://github.com/kb-labb/rixvox@9792405
