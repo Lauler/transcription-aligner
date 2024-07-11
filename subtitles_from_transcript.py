@@ -1,17 +1,18 @@
 import os
+import re
 from typing import List
 
 import ctc_segmentation
 import numpy as np
+import pandas as pd
 import pysrt
 import torch
 import torchaudio
 from nltk.tokenize import sent_tokenize
-from tqdm import tqdm
-from transformers import AutoModelForCTC, Wav2Vec2Processor
-
 from rixvox.api import get_audio_metadata, get_media_file
 from rixvox.text import normalize_text
+from tqdm import tqdm
+from transformers import AutoModelForCTC, Wav2Vec2Processor
 
 
 def align_with_transcript(
@@ -57,11 +58,11 @@ def align_with_transcript(
 def split_speech_from_media(row):
     start_speech = row["start"]
     end_speech = row["end"]
-    speech_nr = row["number"]
+    speech_nr = row["anf_nummer"]
 
     # Extract the audio from the start to the end of the speech with ffmpeg
     os.makedirs("data/audio/speeches", exist_ok=True)
-    audiofile = row["downloadfileurl"]
+    audiofile = row["downloadurl"]
     audiofile = os.path.join("data/audio", audiofile.rsplit("/")[-1])
     basename = os.path.basename(audiofile)
     speech_audiofile = os.path.join("data/audio/speeches", f"{basename}_{speech_nr}.wav")
@@ -108,6 +109,20 @@ def get_probs(speech_metadata):
     return align_probs, len(audio_input[0])
 
 
+def is_only_non_alphanumeric(text):
+    """
+    re.match returns a match object if the pattern is found and None otherwise.
+    """
+    # Contains only 1 or more non-alphanumeric characters
+    return re.match(r"^[^a-zA-Z0-9]+$", text) is not None
+
+
+def word_tokenize(text):
+    text = row["anf_text"].split(" ")  # word tokenization
+    text = [token for token in text if is_only_non_alphanumeric(token) is False]
+    return text
+
+
 def format_timestamp(timestamp):
     """
     Convert timestamp in seconds to "hh:mm:ss,ms" format
@@ -133,7 +148,7 @@ if __name__ == "__main__":
 
     # Get metadata for a riksdag debate through the API for a given debate document id
     meta = get_audio_metadata(rel_dok_id="hb10625")
-    get_media_file(meta["downloadfileurl"][0], progress_bar=True)
+    get_media_file(meta["downloadurl"][0], progress_bar=True)
 
     meta["end"] = meta["start"] + meta["duration"]
 
@@ -157,10 +172,11 @@ if __name__ == "__main__":
         # Chunk text according to what granularity we want alignment timestamps.
         # We sentence tokenize here, but we could also word tokenize, and then
         # at a later stage decide how to create subtitle chunks from word timestamps.
-        transcript = sent_tokenize(row["anftext"])
-        normalized_transcripts.append(
-            [normalize_text(sentence).upper() for sentence in transcript]
-        )
+
+        transcript = sent_tokenize(row["anf_text"])
+        # transcript = word_tokenize(row["anf_text"])
+        normalized_transcript = [normalize_text(token).upper() for token in transcript]
+        normalized_transcripts.append(normalized_transcript)
         original_transcripts.append(transcript)
 
     alignments = []
@@ -173,14 +189,14 @@ if __name__ == "__main__":
             processor,
         )
         for segment in align:
-            segment["start"] += speech_metadata["start_speech"]
-            segment["end"] += speech_metadata["start_speech"]
+            segment["start"] += float(speech_metadata["start_speech"])
+            segment["end"] += float(speech_metadata["start_speech"])
         alignments.append(align)
 
     # Flatten the alignments
     alignments = [segment for speech in alignments for segment in speech]
     # Flatten the original transcripts
-    transcripts = [sentence for speech in original_transcripts for sentence in speech]
+    transcripts = [token for speech in original_transcripts for token in speech]
 
     # Create a subtitles file from the timestamps
     subs = pysrt.SubRipFile()
@@ -194,7 +210,7 @@ if __name__ == "__main__":
         subs.append(pysrt.SubRipItem(index=i, start=start, end=end, text=text))
 
     # Save the subtitles file
-    basename = os.path.basename(meta["downloadfileurl"][0]).replace(".mp4", ".srt")
+    basename = os.path.basename(meta["downloadurl"][0]).replace(".mp4", ".srt")
     subtitle_filename = os.path.join("data/audio", basename)
     subs.save(subtitle_filename)
 
