@@ -34,14 +34,18 @@ def align_with_transcript(
         tok_ids = np.array(tok_ids, dtype="int")
         tokens.append(tok_ids[tok_ids != unk_id])
 
-    # Get nr of characters in the model output (if batched, it's the second dimension)
     probs = probs[0].cpu().numpy() if probs.ndim == 3 else probs.cpu().numpy()
-    probs_size = probs.shape[1] if probs.ndim == 3 else probs.shape[0]
+    # Get nr of encoded CTC frames in the encoder without padding.
+    # I.e. the number of "tokens" the audio was encoded into.
+    ctc_frames = calculate_w2v_output_length(audio_frames, chunk_size=30)
 
     # Align
     char_list = [inv_vocab[i] for i in range(len(inv_vocab))]
     config = ctc_segmentation.CtcSegmentationParameters(char_list=char_list)
-    config.index_duration = audio_frames / probs_size / samplerate
+    config.index_duration = audio_frames / ctc_frames / samplerate
+    print(f"Index duration: {config.index_duration}")
+    print(f"audio_frames: {audio_frames}")
+    print(f"ctc_frames: {ctc_frames}")
     ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_token_list(config, tokens)
     timings, char_probs, state_list = ctc_segmentation.ctc_segmentation(
         config, probs, ground_truth_mat
@@ -79,7 +83,7 @@ def split_speech_from_media(row):
     }
 
 
-def get_probs(speech_metadata):
+def get_probs(speech_metadata, pad=False):
     # Load the audio file
     speech_audiofile = speech_metadata["speech_audiofile"]
     audio_input, sr = torchaudio.load(speech_audiofile)
@@ -93,6 +97,10 @@ def get_probs(speech_metadata):
     all_probs = []
 
     for audio_chunk in audio_chunks:
+        # If audio chunk is shorter than 30 seconds, pad it to 30 seconds
+        if audio_chunk.shape[1] < chunk_size * sr:
+            padding = torch.zeros((1, chunk_size * sr - audio_chunk.shape[1]))
+            audio_chunk = torch.cat([audio_chunk, padding], dim=1)
         input_values = (
             processor(audio_chunk, sampling_rate=16000, return_tensors="pt", padding="longest")
             .input_values.to(device)
@@ -136,6 +144,64 @@ def format_timestamp(timestamp):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
+def calculate_w2v_output_length(
+    audio_frames: int,
+    chunk_size: int,
+    conv_stride: list[int] = [5, 2, 2, 2, 2, 2, 2],
+    sample_rate: int = 16000,
+    frames_first_logit: int = 400,
+):
+    """
+    Calculate the number of output characters from the wav2vec2 model based
+    on the chunking strategy and the number of audio frames.
+
+    The wav2vec2-large model outputs one logit per 320 audio frames. The exception
+    is the first logit, which is output after 400 audio frames (the model's minimum
+    input length).
+
+    We need to take into account the first logit, otherwise the alignment will slowly
+    drift over time for long audio files when chunking the audio for batched inference.
+
+    Parameters
+    ----------
+    audio_frames
+        Number of audio frames in the audio file, or part of audio file to be aligned.
+    chunk_size
+        Number of seconds to chunk the audio by for batched inference.
+    conv_stride
+        The convolutional stride of the wav2vec2 model (see model.config.conv_stride).
+        The product sum of the list is the number of audio frames per output logit.
+        Defaults to the conv_stride of wav2vec2-large.
+    sample_rate
+        The sample rate of the w2v processor, default 16000.
+    frames_first_logit
+        First logit consists of more frames than the rest. Wav2vec2-large outputs
+        the first logit after 400 frames.
+    """
+    frames_per_logit = np.prod(conv_stride)
+    extra_frames = frames_first_logit - frames_per_logit
+
+    frames_per_full_chunk = chunk_size * sample_rate
+    n_full_chunks = audio_frames // frames_per_full_chunk
+
+    # Calculate the number of logit outputs for the full size chunks
+    logits_per_full_chunk = (frames_per_full_chunk - extra_frames) // frames_per_logit
+    n_full_chunk_logits = n_full_chunks * logits_per_full_chunk
+
+    # Calculate the number of logit outputs for the last chunk (may be shorter than the chunk size)
+    n_last_chunk_frames = audio_frames % frames_per_full_chunk
+
+    if n_last_chunk_frames == 0:
+        n_last_chunk_logits = 0
+    elif n_last_chunk_frames < frames_first_logit:
+        # We'll pad the last chunk to 400 frames if it's shorter than the model's minimum input length
+        n_last_chunk_logits = 1
+    else:
+        n_last_chunk_logits = (n_last_chunk_frames - extra_frames) // frames_per_logit
+
+    return n_full_chunk_logits + n_last_chunk_logits
+
+
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -162,7 +228,7 @@ if __name__ == "__main__":
     audio_frames = []
     for speech_metadata in tqdm(speeches_metadata):
         # Run transcription but only keep the probabilities for alignment
-        probs, audio_length = get_probs(speech_metadata)
+        probs, audio_length = get_probs(speech_metadata, pad=True)
         align_probs.append(probs)
         audio_frames.append(audio_length)
 
